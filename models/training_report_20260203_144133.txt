@@ -1,0 +1,40 @@
+================================================================================
+WAF ML MODEL TRAINING REPORT
+================================================================================
+
+Generated: 2026-02-03 14:41:33
+
+
+FEATURES: 45 features
+Feature Names: payload_length, decoded_length, normalized_length, special_char_ratio, digit_ratio, uppercase_ratio, lowercase_ratio, whitespace_ratio, entropy, compression_ratio...
+
+
+MODELS TRAINED: 2
+  - rf
+  - gb
+
+
+PERFORMANCE RESULTS
+--------------------------------------------------------------------------------
+
+RandomForest:
+  Accuracy:  0.8154
+  Precision: 0.6931
+  Recall:    0.9874
+  F1-Score:  0.8145
+  ROC-AUC:   0.9319
+  FPR:       0.3044
+  FNR:       0.0126
+  Confusion Matrix:
+    TP=4950, FP=2192, FN=63, TN=5008
+
+GradientBoosting:
+  Accuracy:  0.8256
+  Precision: 0.7721
+  Recall:    0.8159
+  F1-Score:  0.7934
+  ROC-AUC:   0.9297
+  FPR:       0.1676
+  FNR:       0.1841
+  Confusion Matrix:
+    TP=4090, FP=1207, FN=923, TN=5993
