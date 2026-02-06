@@ -1,22 +1,33 @@
 """
-Phylax WAF Dashboard Backend
-Provides API endpoints for the web dashboard
-Runs on separate port (5001) from WAF engine (5000)
+Phylax WAF - Enhanced Dashboard with Complete Features
+Runs on port 5001
+Provides:
+- Real-time request monitoring
+- Statistics & charts
+- Request history with details
+- Configuration management
+- Attack detection logs
 """
 
 import json
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 import sqlite3
 from pathlib import Path
 import threading
+import secrets
+from functools import wraps
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session
 from flask_cors import CORS
 import requests
 
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
 
 @dataclass
 class RequestLog:
@@ -30,116 +41,217 @@ class RequestLog:
     host: str
     payload: str
     contributing_factors: List[str]
-    
-    def to_dict(self):
-        return asdict(self)
+    status_code: int = 200
+    response_time_ms: float = 0.0
 
+
+@dataclass
+class AlertLog:
+    """Alert entry for suspicious activity"""
+    timestamp: str
+    alert_type: str  # ATTACK, ANOMALY, PATTERN, THRESHOLD
+    severity: str    # LOW, MEDIUM, HIGH, CRITICAL
+    message: str
+    request_id: str
+    request_count: Optional[int] = None
+
+
+# ============================================================================
+# DATABASE LAYER
+# ============================================================================
 
 class DashboardDB:
-    """SQLite database for dashboard"""
+    """SQLite database with enhanced schema"""
     
     def __init__(self, db_path: str = "dashboard.db"):
         """Initialize database"""
         self.db_path = db_path
+        self.lock = threading.Lock()
         self.init_db()
     
     def init_db(self):
         """Create tables if they don't exist"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Request logs table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                request_id TEXT UNIQUE,
-                decision TEXT,
-                risk_score REAL,
-                method TEXT,
-                path TEXT,
-                host TEXT,
-                payload TEXT,
-                factors TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Statistics table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS statistics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                total_requests INTEGER,
-                blocked_requests INTEGER,
-                challenged_requests INTEGER,
-                allowed_requests INTEGER,
-                avg_risk_score REAL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Alerts table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                alert_type TEXT,
-                severity TEXT,
-                message TEXT,
-                request_id TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            # Request logs table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    request_id TEXT UNIQUE,
+                    decision TEXT,
+                    risk_score REAL,
+                    method TEXT,
+                    path TEXT,
+                    host TEXT,
+                    payload TEXT,
+                    factors TEXT,
+                    status_code INTEGER DEFAULT 200,
+                    response_time_ms REAL DEFAULT 0.0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_decision (decision),
+                    INDEX idx_risk_score (risk_score)
+                )
+            ''')
+            
+            # Statistics table (hourly aggregates)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS statistics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT UNIQUE,
+                    total_requests INTEGER,
+                    blocked_requests INTEGER,
+                    challenged_requests INTEGER,
+                    allowed_requests INTEGER,
+                    avg_risk_score REAL,
+                    max_risk_score REAL,
+                    attack_count INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Alerts table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    alert_type TEXT,
+                    severity TEXT,
+                    message TEXT,
+                    request_id TEXT,
+                    request_count INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_severity (severity),
+                    INDEX idx_timestamp (timestamp)
+                )
+            ''')
+            
+            # Configuration table
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS configuration (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT UNIQUE,
+                    value TEXT,
+                    data_type TEXT,
+                    description TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Real-time metrics table (for websocket/streaming)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS realtime_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    requests_per_second REAL,
+                    blocked_per_second REAL,
+                    avg_risk_score REAL,
+                    unique_hosts INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+    
+    # ========================================================================
+    # REQUEST LOGS
+    # ========================================================================
     
     def add_log(self, log: RequestLog):
         """Add request log"""
         try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                
+                c.execute('''
+                    INSERT INTO request_logs 
+                    (timestamp, request_id, decision, risk_score, method, path, host, payload, factors, status_code, response_time_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    log.timestamp,
+                    log.request_id,
+                    log.decision,
+                    log.risk_score,
+                    log.method,
+                    log.path,
+                    log.host,
+                    log.payload[:1000],  # Limit payload size
+                    json.dumps(log.contributing_factors),
+                    log.status_code,
+                    log.response_time_ms
+                ))
+                
+                conn.commit()
+                conn.close()
+        except sqlite3.IntegrityError:
+            pass  # Request already logged
+        except Exception as e:
+            logging.error(f"Error adding log: {e}")
+    
+    def get_logs(self, limit: int = 100, offset: int = 0, decision_filter: str = None) -> List[Dict]:
+        """Get request logs with optional filtering"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            query = '''
+                SELECT timestamp, request_id, decision, risk_score, method, path, host, payload, factors, status_code, response_time_ms
+                FROM request_logs
+            '''
+            params = []
+            
+            if decision_filter and decision_filter in ['ALLOW', 'CHALLENGE', 'BLOCK']:
+                query += ' WHERE decision = ?'
+                params.append(decision_filter)
+            
+            query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+            params.extend([limit, offset])
+            
+            c.execute(query, params)
+            
+            logs = []
+            for row in c.fetchall():
+                logs.append({
+                    'timestamp': row[0],
+                    'request_id': row[1],
+                    'decision': row[2],
+                    'risk_score': row[3],
+                    'method': row[4],
+                    'path': row[5],
+                    'host': row[6],
+                    'payload': row[7],
+                    'factors': json.loads(row[8]) if row[8] else [],
+                    'status_code': row[9],
+                    'response_time_ms': row[10]
+                })
+            
+            conn.close()
+            return logs
+    
+    def get_log_detail(self, request_id: str) -> Optional[Dict]:
+        """Get detailed information for a specific request"""
+        with self.lock:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             
             c.execute('''
-                INSERT INTO request_logs 
-                (timestamp, request_id, decision, risk_score, method, path, host, payload, factors)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                log.timestamp,
-                log.request_id,
-                log.decision,
-                log.risk_score,
-                log.method,
-                log.path,
-                log.host,
-                log.payload[:500],  # Limit payload size
-                json.dumps(log.contributing_factors)
-            ))
+                SELECT timestamp, request_id, decision, risk_score, method, path, host, payload, factors, status_code, response_time_ms
+                FROM request_logs
+                WHERE request_id = ?
+            ''', (request_id,))
             
-            conn.commit()
+            row = c.fetchone()
             conn.close()
-        except sqlite3.IntegrityError:
-            # Request already logged
-            pass
-        except Exception as e:
-            logging.error(f"Error adding log: {e}")
-    
-    def get_logs(self, limit: int = 100, offset: int = 0) -> List[Dict]:
-        """Get recent logs"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        c.execute('''
-            SELECT timestamp, request_id, decision, risk_score, method, path, host, payload, factors
-            FROM request_logs
-            ORDER BY timestamp DESC
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        
-        logs = []
-        for row in c.fetchall():
-            logs.append({
+            
+            if not row:
+                return None
+            
+            return {
                 'timestamp': row[0],
                 'request_id': row[1],
                 'decision': row[2],
@@ -148,85 +260,315 @@ class DashboardDB:
                 'path': row[5],
                 'host': row[6],
                 'payload': row[7],
-                'factors': json.loads(row[8]) if row[8] else []
-            })
-        
-        conn.close()
-        return logs
+                'factors': json.loads(row[8]) if row[8] else [],
+                'status_code': row[9],
+                'response_time_ms': row[10]
+            }
+    
+    def get_total_logs_count(self, decision_filter: str = None) -> int:
+        """Get total count of logs"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            if decision_filter and decision_filter in ['ALLOW', 'CHALLENGE', 'BLOCK']:
+                c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', (decision_filter,))
+            else:
+                c.execute('SELECT COUNT(*) FROM request_logs')
+            
+            count = c.fetchone()[0]
+            conn.close()
+            return count
+    
+    # ========================================================================
+    # STATISTICS
+    # ========================================================================
     
     def get_statistics(self) -> Dict:
         """Get current statistics"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Get counts
-        c.execute('SELECT COUNT(*) FROM request_logs')
-        total = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('BLOCK',))
-        blocked = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('CHALLENGE',))
-        challenged = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('ALLOW',))
-        allowed = c.fetchone()[0]
-        
-        c.execute('SELECT AVG(risk_score) FROM request_logs')
-        avg_risk = c.fetchone()[0] or 0
-        
-        conn.close()
-        
-        return {
-            'total_requests': total,
-            'blocked_requests': blocked,
-            'challenged_requests': challenged,
-            'allowed_requests': allowed,
-            'avg_risk_score': avg_risk,
-            'block_rate': (blocked / total * 100) if total > 0 else 0
-        }
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            # Get counts
+            c.execute('SELECT COUNT(*) FROM request_logs')
+            total = c.fetchone()[0]
+            
+            c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('BLOCK',))
+            blocked = c.fetchone()[0]
+            
+            c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('CHALLENGE',))
+            challenged = c.fetchone()[0]
+            
+            c.execute('SELECT COUNT(*) FROM request_logs WHERE decision = ?', ('ALLOW',))
+            allowed = c.fetchone()[0]
+            
+            c.execute('SELECT AVG(risk_score), MAX(risk_score), MIN(risk_score) FROM request_logs')
+            avg_risk, max_risk, min_risk = c.fetchone()
+            avg_risk = avg_risk or 0
+            max_risk = max_risk or 0
+            min_risk = min_risk or 0
+            
+            # Count unique hosts
+            c.execute('SELECT COUNT(DISTINCT host) FROM request_logs')
+            unique_hosts = c.fetchone()[0]
+            
+            conn.close()
+            
+            return {
+                'total_requests': total,
+                'blocked_requests': blocked,
+                'challenged_requests': challenged,
+                'allowed_requests': allowed,
+                'avg_risk_score': float(avg_risk),
+                'max_risk_score': float(max_risk),
+                'min_risk_score': float(min_risk),
+                'block_rate': (blocked / total * 100) if total > 0 else 0,
+                'challenge_rate': (challenged / total * 100) if total > 0 else 0,
+                'allow_rate': (allowed / total * 100) if total > 0 else 0,
+                'unique_hosts': unique_hosts
+            }
     
     def get_hourly_stats(self, hours: int = 24) -> List[Dict]:
         """Get statistics by hour"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        stats = []
-        for i in range(hours):
-            hour_ago = (datetime.utcnow() - timedelta(hours=i)).strftime('%Y-%m-%d %H:00')
-            hour_after = (datetime.utcnow() - timedelta(hours=i-1)).strftime('%Y-%m-%d %H:00')
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            stats = []
+            for i in range(hours):
+                hour_ago = (datetime.utcnow() - timedelta(hours=i)).strftime('%Y-%m-%d %H:00')
+                hour_after = (datetime.utcnow() - timedelta(hours=i-1)).strftime('%Y-%m-%d %H:00')
+                
+                c.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN decision = 'BLOCK' THEN 1 ELSE 0 END) as blocked,
+                        SUM(CASE WHEN decision = 'CHALLENGE' THEN 1 ELSE 0 END) as challenged,
+                        SUM(CASE WHEN decision = 'ALLOW' THEN 1 ELSE 0 END) as allowed,
+                        AVG(risk_score) as avg_risk
+                    FROM request_logs
+                    WHERE timestamp BETWEEN ? AND ?
+                ''', (hour_ago, hour_after))
+                
+                row = c.fetchone()
+                stats.append({
+                    'hour': hour_ago,
+                    'total': row[0] or 0,
+                    'blocked': row[1] or 0,
+                    'challenged': row[2] or 0,
+                    'allowed': row[3] or 0,
+                    'avg_risk_score': float(row[4]) if row[4] else 0
+                })
+            
+            conn.close()
+            return list(reversed(stats))
+    
+    def get_top_attacked_paths(self, limit: int = 10) -> List[Dict]:
+        """Get most targeted paths"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
             
             c.execute('''
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN decision = 'BLOCK' THEN 1 ELSE 0 END) as blocked,
-                    SUM(CASE WHEN decision = 'CHALLENGE' THEN 1 ELSE 0 END) as challenged,
-                    SUM(CASE WHEN decision = 'ALLOW' THEN 1 ELSE 0 END) as allowed
+                SELECT path, COUNT(*) as count, 
+                       SUM(CASE WHEN decision = 'BLOCK' THEN 1 ELSE 0 END) as blocked,
+                       AVG(risk_score) as avg_risk
                 FROM request_logs
-                WHERE timestamp BETWEEN ? AND ?
-            ''', (hour_ago, hour_after))
+                WHERE decision IN ('BLOCK', 'CHALLENGE')
+                GROUP BY path
+                ORDER BY count DESC
+                LIMIT ?
+            ''', (limit,))
             
-            row = c.fetchone()
-            stats.append({
-                'hour': hour_ago,
-                'total': row[0] or 0,
-                'blocked': row[1] or 0,
-                'challenged': row[2] or 0,
-                'allowed': row[3] or 0
-            })
-        
-        conn.close()
-        return list(reversed(stats))
+            paths = []
+            for row in c.fetchall():
+                paths.append({
+                    'path': row[0],
+                    'count': row[1],
+                    'blocked': row[2],
+                    'avg_risk_score': float(row[3]) if row[3] else 0
+                })
+            
+            conn.close()
+            return paths
+    
+    def get_top_sources(self, limit: int = 10) -> List[Dict]:
+        """Get top source hosts/IPs"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            c.execute('''
+                SELECT host, COUNT(*) as count, 
+                       SUM(CASE WHEN decision = 'BLOCK' THEN 1 ELSE 0 END) as blocked,
+                       AVG(risk_score) as avg_risk
+                FROM request_logs
+                GROUP BY host
+                ORDER BY count DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            hosts = []
+            for row in c.fetchall():
+                hosts.append({
+                    'host': row[0],
+                    'count': row[1],
+                    'blocked': row[2],
+                    'avg_risk_score': float(row[3]) if row[3] else 0
+                })
+            
+            conn.close()
+            return hosts
+    
+    # ========================================================================
+    # ALERTS
+    # ========================================================================
+    
+    def add_alert(self, alert: AlertLog):
+        """Add alert"""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                
+                c.execute('''
+                    INSERT INTO alerts (timestamp, alert_type, severity, message, request_id, request_count)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    alert.timestamp,
+                    alert.alert_type,
+                    alert.severity,
+                    alert.message,
+                    alert.request_id,
+                    alert.request_count
+                ))
+                
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            logging.error(f"Error adding alert: {e}")
+    
+    def get_alerts(self, limit: int = 50, offset: int = 0, severity: str = None) -> List[Dict]:
+        """Get alerts with optional severity filter"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            query = 'SELECT timestamp, alert_type, severity, message, request_id, request_count FROM alerts'
+            params = []
+            
+            if severity:
+                query += ' WHERE severity = ?'
+                params.append(severity)
+            
+            query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+            params.extend([limit, offset])
+            
+            c.execute(query, params)
+            
+            alerts = []
+            for row in c.fetchall():
+                alerts.append({
+                    'timestamp': row[0],
+                    'alert_type': row[1],
+                    'severity': row[2],
+                    'message': row[3],
+                    'request_id': row[4],
+                    'request_count': row[5]
+                })
+            
+            conn.close()
+            return alerts
+    
+    def get_critical_alerts(self, limit: int = 10) -> List[Dict]:
+        """Get critical and high severity alerts"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            c.execute('''
+                SELECT timestamp, alert_type, severity, message, request_id, request_count
+                FROM alerts
+                WHERE severity IN ('CRITICAL', 'HIGH')
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            alerts = []
+            for row in c.fetchall():
+                alerts.append({
+                    'timestamp': row[0],
+                    'alert_type': row[1],
+                    'severity': row[2],
+                    'message': row[3],
+                    'request_id': row[4],
+                    'request_count': row[5]
+                })
+            
+            conn.close()
+            return alerts
+    
+    # ========================================================================
+    # CONFIGURATION
+    # ========================================================================
+    
+    def save_config(self, key: str, value: str, data_type: str = 'string', description: str = ''):
+        """Save configuration value"""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                c = conn.cursor()
+                
+                c.execute('''
+                    INSERT OR REPLACE INTO configuration (key, value, data_type, description)
+                    VALUES (?, ?, ?, ?)
+                ''', (key, value, data_type, description))
+                
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            logging.error(f"Error saving config: {e}")
+    
+    def get_config(self, key: str = None) -> Dict:
+        """Get configuration"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            if key:
+                c.execute('SELECT value, data_type FROM configuration WHERE key = ?', (key,))
+                row = c.fetchone()
+                conn.close()
+                if row:
+                    return {'value': row[0], 'type': row[1]}
+                return {}
+            else:
+                c.execute('SELECT key, value, data_type, description FROM configuration')
+                config = {}
+                for row in c.fetchall():
+                    config[row[0]] = {
+                        'value': row[1],
+                        'type': row[2],
+                        'description': row[3]
+                    }
+                conn.close()
+                return config
 
 
-class DashboardApp:
-    """Dashboard Flask application"""
+# ============================================================================
+# DASHBOARD APPLICATION
+# ============================================================================
+
+class EnhancedDashboardApp:
+    """Enhanced dashboard with all requested features"""
     
     def __init__(self, waf_url: str = "http://localhost:5000", port: int = 5001):
         """Initialize dashboard"""
         self.waf_url = waf_url
         self.port = port
         self.app = Flask(__name__)
+        self.app.secret_key = secrets.token_hex(16)
         CORS(self.app)
         
         # Database
@@ -235,14 +577,20 @@ class DashboardApp:
         # Logger
         self.logger = self._setup_logger()
         
+        # In-memory cache for real-time metrics
+        self.realtime_metrics = {
+            'current_requests': [],
+            'last_update': datetime.utcnow()
+        }
+        
         # Setup routes
         self._setup_routes()
         
-        self.logger.info(f"Dashboard initialized on port {port}")
+        self.logger.info(f"Enhanced Dashboard initialized on port {port}")
     
     def _setup_logger(self) -> logging.Logger:
         """Setup logging"""
-        logger = logging.getLogger("Dashboard")
+        logger = logging.getLogger("EnhancedDashboard")
         logger.setLevel(logging.INFO)
         
         handler = logging.StreamHandler()
@@ -257,9 +605,9 @@ class DashboardApp:
     def _setup_routes(self):
         """Setup Flask routes"""
         
-        # ============================================================
+        # ====================================================================
         # WEB PAGES
-        # ============================================================
+        # ====================================================================
         
         @self.app.route('/')
         def index():
@@ -271,53 +619,195 @@ class DashboardApp:
             """Dashboard page"""
             return self._render_dashboard()
         
+        @self.app.route('/real-time')
+        def real_time():
+            """Real-time monitoring page"""
+            return self._render_realtime_page()
+        
+        @self.app.route('/requests')
+        def requests_page():
+            """Request history page"""
+            return self._render_requests_page()
+        
+        @self.app.route('/request/<request_id>')
+        def request_detail(request_id):
+            """Request detail page"""
+            return self._render_request_detail(request_id)
+        
+        @self.app.route('/attacks')
+        def attacks_page():
+            """Attack detection logs page"""
+            return self._render_attacks_page()
+        
+        @self.app.route('/config')
+        def config_page():
+            """Configuration management page"""
+            return self._render_config_page()
+        
         @self.app.route('/test')
         def test_page():
             """Request testing page"""
             return self._render_test_page()
         
-        @self.app.route('/logs')
-        def logs_page():
-            """Request logs page"""
-            return self._render_logs_page()
+        # ====================================================================
+        # REAL-TIME MONITORING APIs
+        # ====================================================================
         
-        # ============================================================
-        # API ENDPOINTS
-        # ============================================================
+        @self.app.route('/api/realtime/stats')
+        def realtime_stats():
+            """Get real-time statistics"""
+            stats = self.db.get_statistics()
+            recent_logs = self.db.get_logs(limit=10)
+            
+            return jsonify({
+                'stats': stats,
+                'recent_requests': recent_logs,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        @self.app.route('/api/realtime/events')
+        def realtime_events():
+            """Get real-time events (for streaming/websocket)"""
+            limit = request.args.get('limit', 5, type=int)
+            recent = self.db.get_logs(limit=limit)
+            return jsonify({'events': recent})
+        
+        # ====================================================================
+        # STATISTICS APIs
+        # ====================================================================
         
         @self.app.route('/api/stats')
         def get_stats():
-            """Get statistics"""
+            """Get overall statistics"""
             stats = self.db.get_statistics()
-            
-            # Try to get live stats from WAF
-            try:
-                response = requests.get(f"{self.waf_url}/waf/stats", timeout=2)
-                live_stats = response.json().get('statistics', {})
-                stats.update(live_stats)
-            except:
-                pass
-            
             return jsonify(stats)
         
-        @self.app.route('/api/logs')
-        def get_logs():
-            """Get request logs"""
-            limit = request.args.get('limit', 100, type=int)
-            offset = request.args.get('offset', 0, type=int)
-            
-            logs = self.db.get_logs(limit, offset)
-            return jsonify({'logs': logs, 'total': self.db.get_statistics()['total_requests']})
-        
-        @self.app.route('/api/hourly-stats')
-        def get_hourly():
+        @self.app.route('/api/stats/hourly')
+        def get_hourly_stats():
             """Get hourly statistics"""
             hours = request.args.get('hours', 24, type=int)
             stats = self.db.get_hourly_stats(hours)
             return jsonify({'stats': stats})
         
+        @self.app.route('/api/stats/top-paths')
+        def get_top_paths():
+            """Get most targeted paths"""
+            limit = request.args.get('limit', 10, type=int)
+            paths = self.db.get_top_attacked_paths(limit)
+            return jsonify({'paths': paths})
+        
+        @self.app.route('/api/stats/top-sources')
+        def get_top_sources():
+            """Get top source hosts"""
+            limit = request.args.get('limit', 10, type=int)
+            sources = self.db.get_top_sources(limit)
+            return jsonify({'sources': sources})
+        
+        # ====================================================================
+        # REQUEST HISTORY APIs
+        # ====================================================================
+        
+        @self.app.route('/api/requests')
+        def get_requests():
+            """Get request logs"""
+            limit = request.args.get('limit', 100, type=int)
+            offset = request.args.get('offset', 0, type=int)
+            decision_filter = request.args.get('decision', None)
+            
+            logs = self.db.get_logs(limit, offset, decision_filter)
+            total = self.db.get_total_logs_count(decision_filter)
+            
+            return jsonify({
+                'logs': logs,
+                'total': total,
+                'page': offset // limit if limit > 0 else 0,
+                'per_page': limit
+            })
+        
+        @self.app.route('/api/request/<request_id>')
+        def get_request_detail(request_id):
+            """Get request detail"""
+            log = self.db.get_log_detail(request_id)
+            if not log:
+                return jsonify({'error': 'Request not found'}), 404
+            return jsonify(log)
+        
+        # ====================================================================
+        # ATTACK LOGS APIs
+        # ====================================================================
+        
+        @self.app.route('/api/alerts')
+        def get_alerts():
+            """Get alerts/attack logs"""
+            limit = request.args.get('limit', 50, type=int)
+            offset = request.args.get('offset', 0, type=int)
+            severity = request.args.get('severity', None)
+            
+            alerts = self.db.get_alerts(limit, offset, severity)
+            
+            return jsonify({
+                'alerts': alerts,
+                'total': len(alerts),
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        @self.app.route('/api/alerts/critical')
+        def get_critical_alerts():
+            """Get critical alerts"""
+            alerts = self.db.get_critical_alerts(limit=20)
+            return jsonify({'alerts': alerts})
+        
+        @self.app.route('/api/alert', methods=['POST'])
+        def create_alert():
+            """Create a new alert"""
+            data = request.get_json()
+            alert = AlertLog(
+                timestamp=datetime.utcnow().isoformat(),
+                alert_type=data.get('type', 'ATTACK'),
+                severity=data.get('severity', 'MEDIUM'),
+                message=data.get('message', ''),
+                request_id=data.get('request_id', ''),
+                request_count=data.get('request_count')
+            )
+            self.db.add_alert(alert)
+            return jsonify({'status': 'created'}), 201
+        
+        # ====================================================================
+        # CONFIGURATION APIs
+        # ====================================================================
+        
+        @self.app.route('/api/config')
+        def get_config():
+            """Get all configuration"""
+            config = self.db.get_config()
+            return jsonify(config)
+        
+        @self.app.route('/api/config/<key>')
+        def get_config_value(key):
+            """Get specific config value"""
+            value = self.db.get_config(key)
+            if not value:
+                return jsonify({'error': 'Config key not found'}), 404
+            return jsonify(value)
+        
+        @self.app.route('/api/config', methods=['POST'])
+        def save_config_value():
+            """Save configuration"""
+            data = request.get_json()
+            self.db.save_config(
+                key=data.get('key'),
+                value=data.get('value'),
+                data_type=data.get('type', 'string'),
+                description=data.get('description', '')
+            )
+            return jsonify({'status': 'saved'}), 201
+        
+        # ====================================================================
+        # TEST & UTILITY APIs
+        # ====================================================================
+        
         @self.app.route('/api/test', methods=['POST'])
-        def test_request():
+        def test_request_endpoint():
             """Test a request through WAF"""
             data = request.get_json()
             raw_http = data.get('raw_http', '')
@@ -341,11 +831,17 @@ class DashboardApp:
                     method=self._extract_method(raw_http),
                     path=self._extract_path(raw_http),
                     host=self._extract_host(raw_http),
-                    payload=raw_http[:500],
-                    contributing_factors=result.get('contributing_factors', [])
+                    payload=raw_http[:1000],
+                    contributing_factors=result.get('contributing_factors', []),
+                    status_code=200,
+                    response_time_ms=response.elapsed.total_seconds() * 1000
                 )
                 
                 self.db.add_log(log)
+                
+                # Check for alerts
+                if result.get('decision') == 'BLOCK':
+                    self._generate_alert_if_needed(result)
                 
                 return jsonify(result)
             
@@ -360,19 +856,42 @@ class DashboardApp:
                 response = requests.get(f"{self.waf_url}/waf/health", timeout=2)
                 return jsonify({
                     'status': 'healthy' if response.status_code == 200 else 'unhealthy',
-                    'waf_url': self.waf_url
+                    'dashboard': 'running',
+                    'timestamp': datetime.utcnow().isoformat()
                 })
             except:
-                return jsonify({'status': 'unhealthy', 'waf_url': self.waf_url})
+                return jsonify({'status': 'unhealthy', 'dashboard': 'running'})
         
-        @self.app.route('/api/config')
-        def get_config():
-            """Get WAF configuration"""
-            try:
-                response = requests.get(f"{self.waf_url}/waf/config", timeout=2)
-                return jsonify(response.json())
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+        @self.app.route('/api/export')
+        def export_data():
+            """Export data as JSON"""
+            stats = self.db.get_statistics()
+            hourly = self.db.get_hourly_stats(24)
+            top_paths = self.db.get_top_attacked_paths(10)
+            top_sources = self.db.get_top_sources(10)
+            alerts = self.db.get_alerts(limit=100)
+            
+            return jsonify({
+                'timestamp': datetime.utcnow().isoformat(),
+                'statistics': stats,
+                'hourly_stats': hourly,
+                'top_paths': top_paths,
+                'top_sources': top_sources,
+                'recent_alerts': alerts
+            })
+    
+    def _generate_alert_if_needed(self, waf_result: Dict):
+        """Generate alert based on WAF decision"""
+        if waf_result.get('risk_score', 0) > 80:
+            alert = AlertLog(
+                timestamp=datetime.utcnow().isoformat(),
+                alert_type='ATTACK',
+                severity='CRITICAL',
+                message=f"High-risk attack detected: {waf_result.get('reason', 'Unknown')}",
+                request_id=waf_result.get('request_id', ''),
+                request_count=None
+            )
+            self.db.add_alert(alert)
     
     def _extract_method(self, raw_http: str) -> str:
         """Extract HTTP method"""
@@ -398,16 +917,61 @@ class DashboardApp:
             pass
         return "unknown"
     
+    # ========================================================================
+    # HTML TEMPLATES
+    # ========================================================================
+    
     def _render_dashboard(self) -> str:
         """Render main dashboard page"""
-        return '''
+        return render_template_string(DASHBOARD_TEMPLATE)
+    
+    def _render_realtime_page(self) -> str:
+        """Render real-time monitoring page"""
+        return render_template_string(REALTIME_TEMPLATE)
+    
+    def _render_requests_page(self) -> str:
+        """Render request history page"""
+        return render_template_string(REQUESTS_TEMPLATE)
+    
+    def _render_request_detail(self, request_id: str) -> str:
+        """Render request detail page"""
+        template = REQUEST_DETAIL_TEMPLATE
+        return render_template_string(template, request_id=request_id)
+    
+    def _render_attacks_page(self) -> str:
+        """Render attack detection logs page"""
+        return render_template_string(ATTACKS_TEMPLATE)
+    
+    def _render_config_page(self) -> str:
+        """Render configuration management page"""
+        return render_template_string(CONFIG_TEMPLATE)
+    
+    def _render_test_page(self) -> str:
+        """Render request testing page"""
+        return render_template_string(TEST_TEMPLATE)
+    
+    def run(self, host: str = '0.0.0.0', port: int = None, debug: bool = False):
+        """Run dashboard"""
+        if port is None:
+            port = self.port
+        
+        self.logger.info(f"🚀 Starting Enhanced Dashboard on http://0.0.0.0:{port}")
+        self.app.run(host=host, port=port, debug=debug, threaded=True)
+
+
+# ============================================================================
+# HTML TEMPLATES
+# ============================================================================
+
+DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Phylax WAF Dashboard</title>
+    <title>Phylax WAF - Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * {
             margin: 0;
@@ -423,106 +987,168 @@ class DashboardApp:
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
         }
         
         header {
             background: white;
-            padding: 20px 30px;
+            padding: 25px 30px;
             border-radius: 10px;
             margin-bottom: 30px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
         }
         
         h1 {
             color: #667eea;
-            font-size: 28px;
+            font-size: 32px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         
-        .status {
+        .header-actions {
             display: flex;
-            gap: 20px;
+            gap: 15px;
             align-items: center;
         }
         
-        .status-badge {
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
             padding: 8px 16px;
+            background: #f0f0f0;
             border-radius: 20px;
             font-weight: bold;
-            font-size: 14px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
         }
         
         .status-healthy {
-            background: #d4edda;
-            color: #155724;
+            background: #27ae60;
         }
         
         .status-unhealthy {
-            background: #f8d7da;
-            color: #721c24;
+            background: #e74c3c;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
         
         nav {
             display: flex;
             gap: 10px;
+            flex-wrap: wrap;
         }
         
-        nav a {
-            padding: 8px 16px;
+        nav a, nav button {
+            padding: 10px 18px;
             background: #667eea;
             color: white;
             text-decoration: none;
+            border: none;
             border-radius: 5px;
-            transition: background 0.3s;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 14px;
+            font-weight: 500;
         }
         
-        nav a:hover {
+        nav a:hover, nav button:hover {
             background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         }
         
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
         
         .card {
             background: white;
-            padding: 20px;
+            padding: 25px;
             border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 30px rgba(0,0,0,0.15);
         }
         
         .card-title {
-            font-size: 14px;
-            color: #666;
+            font-size: 13px;
+            color: #999;
             margin-bottom: 10px;
             text-transform: uppercase;
+            font-weight: 600;
+            letter-spacing: 0.5px;
         }
         
         .card-value {
-            font-size: 32px;
+            font-size: 36px;
             font-weight: bold;
             color: #667eea;
+            margin: 15px 0;
         }
         
         .card-subtext {
             font-size: 12px;
             color: #999;
-            margin-top: 5px;
+            margin-top: 8px;
+        }
+        
+        .card-progress {
+            width: 100%;
+            height: 8px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        
+        .card-progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        .card.danger {
+            border-left: 4px solid #e74c3c;
         }
         
         .card.danger .card-value {
             color: #e74c3c;
         }
         
+        .card.warning {
+            border-left: 4px solid #f39c12;
+        }
+        
         .card.warning .card-value {
             color: #f39c12;
+        }
+        
+        .card.success {
+            border-left: 4px solid #27ae60;
         }
         
         .card.success .card-value {
@@ -531,19 +1157,44 @@ class DashboardApp:
         
         .chart-container {
             background: white;
-            padding: 20px;
+            padding: 25px;
             border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
             margin-bottom: 30px;
-            position: relative;
-            height: 400px;
         }
         
-        .chart-title {
+        .chart-container h3 {
             font-size: 18px;
-            font-weight: bold;
             color: #333;
-            margin-bottom: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .chart-wrapper {
+            position: relative;
+            height: 400px;
+            margin-bottom: 20px;
+        }
+        
+        .chart-wrapper canvas {
+            max-height: 400px;
+        }
+        
+        .alert-box {
+            background: #fff3cd;
+            border-left: 4px solid #f39c12;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-box.danger {
+            background: #f8d7da;
+            border-left-color: #e74c3c;
+        }
+        
+        .alert-box.success {
+            background: #d4edda;
+            border-left-color: #27ae60;
         }
         
         button {
@@ -561,9 +1212,25 @@ class DashboardApp:
             background: #764ba2;
         }
         
-        .refresh-btn {
-            padding: 8px 16px;
+        .refresh-indicator {
             font-size: 12px;
+            color: #999;
+        }
+        
+        .loading-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
         
         @media (max-width: 768px) {
@@ -572,11 +1239,20 @@ class DashboardApp:
             }
             
             h1 {
-                font-size: 20px;
+                font-size: 24px;
+            }
+            
+            header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            
+            .header-actions {
+                width: 100%;
             }
             
             nav {
-                flex-wrap: wrap;
+                width: 100%;
             }
         }
     </style>
@@ -584,17 +1260,25 @@ class DashboardApp:
 <body>
     <div class="container">
         <header>
-            <h1>🛡️ Phylax WAF Dashboard</h1>
-            <div class="status">
-                <span class="status-badge status-healthy" id="status">● Healthy</span>
-                <button class="refresh-btn" onclick="location.reload()">Refresh</button>
+            <h1>
+                <i class="fas fa-shield-alt"></i> Phylax WAF Dashboard
+            </h1>
+            <div class="header-actions">
+                <div class="status-indicator">
+                    <div class="status-dot status-healthy" id="status"></div>
+                    <span id="status-text">Healthy</span>
+                </div>
+                <button onclick="location.reload()"><i class="fas fa-sync"></i> Refresh</button>
             </div>
         </header>
         
         <nav>
-            <a href="/">Dashboard</a>
-            <a href="/test">Test Request</a>
-            <a href="/logs">Request Logs</a>
+            <a href="/"><i class="fas fa-home"></i> Dashboard</a>
+            <a href="/real-time"><i class="fas fa-tachometer-alt"></i> Real-Time</a>
+            <a href="/requests"><i class="fas fa-history"></i> Requests</a>
+            <a href="/attacks"><i class="fas fa-exclamation-circle"></i> Attacks</a>
+            <a href="/config"><i class="fas fa-cog"></i> Config</a>
+            <a href="/test"><i class="fas fa-flask"></i> Test</a>
         </nav>
         
         <div class="grid">
@@ -607,26 +1291,66 @@ class DashboardApp:
             <div class="card danger">
                 <div class="card-title">Blocked</div>
                 <div class="card-value" id="blocked-requests">0</div>
-                <div class="card-subtext">Attack prevented</div>
+                <div class="card-subtext"><span id="block-rate">0</span>% of all requests</div>
+                <div class="card-progress">
+                    <div class="card-progress-bar" id="block-progress"></div>
+                </div>
             </div>
             
             <div class="card warning">
                 <div class="card-title">Challenged</div>
                 <div class="card-value" id="challenged-requests">0</div>
-                <div class="card-subtext">Requires verification</div>
+                <div class="card-subtext"><span id="challenge-rate">0</span>% of all requests</div>
+                <div class="card-progress">
+                    <div class="card-progress-bar" id="challenge-progress"></div>
+                </div>
             </div>
             
             <div class="card success">
                 <div class="card-title">Allowed</div>
                 <div class="card-value" id="allowed-requests">0</div>
-                <div class="card-subtext">Safe requests</div>
+                <div class="card-subtext"><span id="allow-rate">0</span>% of all requests</div>
+                <div class="card-progress">
+                    <div class="card-progress-bar" id="allow-progress"></div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-title">Avg Risk Score</div>
+                <div class="card-value" id="avg-risk-score">0</div>
+                <div class="card-subtext">0-100 scale</div>
+            </div>
+            
+            <div class="card">
+                <div class="card-title">Unique Sources</div>
+                <div class="card-value" id="unique-hosts">0</div>
+                <div class="card-subtext">Unique hosts</div>
             </div>
         </div>
         
         <div class="chart-container">
-            <div class="chart-title">Requests Over Time</div>
-            <canvas id="statsChart"></canvas>
+            <h3><i class="fas fa-chart-line"></i> Requests Over Time (24h)</h3>
+            <div class="chart-wrapper">
+                <canvas id="statsChart"></canvas>
+            </div>
         </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px;">
+            <div class="chart-container">
+                <h3><i class="fas fa-bullseye"></i> Most Targeted Paths</h3>
+                <div id="top-paths" style="font-size: 14px;"></div>
+            </div>
+            
+            <div class="chart-container">
+                <h3><i class="fas fa-network-wired"></i> Top Source Hosts</h3>
+                <div id="top-sources" style="font-size: 14px;"></div>
+            </div>
+        </div>
+        
+        <p class="refresh-indicator">
+            <i class="fas fa-clock"></i> Last updated: <span id="last-update">--:--:--</span> 
+            (Auto-refresh every 30 seconds)
+        </p>
     </div>
     
     <script>
@@ -641,6 +1365,18 @@ class DashboardApp:
                 document.getElementById('blocked-requests').textContent = data.blocked_requests || 0;
                 document.getElementById('challenged-requests').textContent = data.challenged_requests || 0;
                 document.getElementById('allowed-requests').textContent = data.allowed_requests || 0;
+                document.getElementById('avg-risk-score').textContent = (data.avg_risk_score || 0).toFixed(1);
+                document.getElementById('unique-hosts').textContent = data.unique_hosts || 0;
+                
+                document.getElementById('block-rate').textContent = data.block_rate.toFixed(1);
+                document.getElementById('challenge-rate').textContent = data.challenge_rate.toFixed(1);
+                document.getElementById('allow-rate').textContent = data.allow_rate.toFixed(1);
+                
+                document.getElementById('block-progress').style.width = data.block_rate + '%';
+                document.getElementById('challenge-progress').style.width = data.challenge_rate + '%';
+                document.getElementById('allow-progress').style.width = data.allow_rate + '%';
+                
+                updateLastUpdate();
             } catch (error) {
                 console.error('Error loading stats:', error);
             }
@@ -648,11 +1384,14 @@ class DashboardApp:
         
         async function loadChart() {
             try {
-                const response = await fetch('/api/hourly-stats?hours=24');
+                const response = await fetch('/api/stats/hourly?hours=24');
                 const data = await response.json();
                 const stats = data.stats;
                 
-                const labels = stats.map(s => new Date(s.hour).toLocaleTimeString());
+                const labels = stats.map(s => {
+                    const dt = new Date(s.hour);
+                    return dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+                });
                 const allowedData = stats.map(s => s.allowed);
                 const challengedData = stats.map(s => s.challenged);
                 const blockedData = stats.map(s => s.blocked);
@@ -673,21 +1412,24 @@ class DashboardApp:
                                 data: allowedData,
                                 borderColor: '#27ae60',
                                 backgroundColor: 'rgba(39, 174, 96, 0.1)',
-                                tension: 0.3
+                                tension: 0.3,
+                                fill: true
                             },
                             {
                                 label: 'Challenged',
                                 data: challengedData,
                                 borderColor: '#f39c12',
                                 backgroundColor: 'rgba(243, 156, 18, 0.1)',
-                                tension: 0.3
+                                tension: 0.3,
+                                fill: true
                             },
                             {
                                 label: 'Blocked',
                                 data: blockedData,
                                 borderColor: '#e74c3c',
                                 backgroundColor: 'rgba(231, 76, 60, 0.1)',
-                                tension: 0.3
+                                tension: 0.3,
+                                fill: true
                             }
                         ]
                     },
@@ -696,12 +1438,14 @@ class DashboardApp:
                         maintainAspectRatio: false,
                         plugins: {
                             legend: {
-                                position: 'top'
+                                position: 'top',
+                                labels: { font: { size: 12 } }
                             }
                         },
                         scales: {
                             y: {
-                                beginAtZero: true
+                                beginAtZero: true,
+                                ticks: { stepSize: 1 }
                             }
                         }
                     }
@@ -711,681 +1455,107 @@ class DashboardApp:
             }
         }
         
+        async function loadTopPaths() {
+            try {
+                const response = await fetch('/api/stats/top-paths?limit=8');
+                const data = await response.json();
+                const paths = data.paths;
+                
+                let html = '<ul style="list-style: none; padding: 0;">';
+                paths.forEach((path, idx) => {
+                    html += `
+                        <li style="padding: 8px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between;">
+                            <span>${idx+1}. <strong>${path.path || '/'}</strong></span>
+                            <span style="color: #e74c3c;">${path.blocked || 0} blocks</span>
+                        </li>
+                    `;
+                });
+                html += '</ul>';
+                document.getElementById('top-paths').innerHTML = html;
+            } catch (error) {
+                console.error('Error loading top paths:', error);
+            }
+        }
+        
+        async function loadTopSources() {
+            try {
+                const response = await fetch('/api/stats/top-sources?limit=8');
+                const data = await response.json();
+                const sources = data.sources;
+                
+                let html = '<ul style="list-style: none; padding: 0;">';
+                sources.forEach((source, idx) => {
+                    html += `
+                        <li style="padding: 8px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between;">
+                            <span>${idx+1}. <strong>${source.host}</strong></span>
+                            <span style="color: #667eea;">${source.count} reqs</span>
+                        </li>
+                    `;
+                });
+                html += '</ul>';
+                document.getElementById('top-sources').innerHTML = html;
+            } catch (error) {
+                console.error('Error loading top sources:', error);
+            }
+        }
+        
         async function checkHealth() {
             try {
                 const response = await fetch('/api/health');
                 const data = await response.json();
-                const badge = document.getElementById('status');
+                const indicator = document.getElementById('status');
+                const text = document.getElementById('status-text');
                 
                 if (data.status === 'healthy') {
-                    badge.textContent = '● Healthy';
-                    badge.className = 'status-badge status-healthy';
+                    indicator.className = 'status-dot status-healthy';
+                    text.textContent = 'Healthy';
                 } else {
-                    badge.textContent = '● Unhealthy';
-                    badge.className = 'status-badge status-unhealthy';
+                    indicator.className = 'status-dot status-unhealthy';
+                    text.textContent = 'Unhealthy';
                 }
             } catch (error) {
                 console.error('Error checking health:', error);
             }
         }
         
+        function updateLastUpdate() {
+            const now = new Date();
+            document.getElementById('last-update').textContent = 
+                now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+        
         // Load data on page load
         window.addEventListener('load', () => {
             loadStats();
             loadChart();
+            loadTopPaths();
+            loadTopSources();
             checkHealth();
+            updateLastUpdate();
             
             // Refresh every 30 seconds
             setInterval(() => {
                 loadStats();
                 loadChart();
+                loadTopPaths();
+                loadTopSources();
                 checkHealth();
             }, 30000);
         });
     </script>
 </body>
 </html>
-        '''
-    
-    def _render_test_page(self) -> str:
-        """Render request testing page"""
-        return '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Test Request - Phylax WAF</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1000px;
-            margin: 0 auto;
-        }
-        
-        header {
-            background: white;
-            padding: 20px 30px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        h1 {
-            color: #667eea;
-            font-size: 28px;
-            margin-bottom: 10px;
-        }
-        
-        nav {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        
-        nav a {
-            padding: 8px 16px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
-            transition: background 0.3s;
-        }
-        
-        nav a:hover {
-            background: #764ba2;
-        }
-        
-        .main {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        label {
-            display: block;
-            font-weight: bold;
-            color: #333;
-            margin-bottom: 8px;
-        }
-        
-        textarea {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-family: 'Courier New', monospace;
-            font-size: 13px;
-            resize: vertical;
-            min-height: 200px;
-        }
-        
-        button {
-            padding: 12px 30px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-            transition: background 0.3s;
-        }
-        
-        button:hover {
-            background: #764ba2;
-        }
-        
-        .result {
-            margin-top: 30px;
-            padding: 20px;
-            border-radius: 5px;
-            display: none;
-        }
-        
-        .result.show {
-            display: block;
-        }
-        
-        .result.allow {
-            background: #d4edda;
-            border: 1px solid #c3e6cb;
-            color: #155724;
-        }
-        
-        .result.challenge {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            color: #856404;
-        }
-        
-        .result.block {
-            background: #f8d7da;
-            border: 1px solid #f5c6cb;
-            color: #721c24;
-        }
-        
-        .result h3 {
-            margin-bottom: 10px;
-        }
-        
-        .result-details {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 15px;
-            font-size: 14px;
-        }
-        
-        .detail-item {
-            display: flex;
-            justify-content: space-between;
-        }
-        
-        .detail-label {
-            font-weight: bold;
-            color: #333;
-        }
-        
-        .detail-value {
-            text-align: right;
-        }
-        
-        .loading {
-            display: none;
-            text-align: center;
-            color: #667eea;
-            margin-top: 20px;
-        }
-        
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #667eea;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        .templates {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-        }
-        
-        .templates h3 {
-            font-size: 14px;
-            margin-bottom: 10px;
-            color: #333;
-        }
-        
-        .template-btn {
-            padding: 6px 12px;
-            margin-right: 5px;
-            margin-bottom: 5px;
-            background: white;
-            color: #667eea;
-            border: 1px solid #667eea;
-            font-size: 12px;
-            cursor: pointer;
-            border-radius: 3px;
-            transition: all 0.3s;
-        }
-        
-        .template-btn:hover {
-            background: #667eea;
-            color: white;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🧪 Test Request</h1>
-            <nav>
-                <a href="/">Dashboard</a>
-                <a href="/test">Test Request</a>
-                <a href="/logs">Request Logs</a>
-            </nav>
-        </header>
-        
-        <div class="main">
-            <div class="form-group">
-                <label>Request Templates:</label>
-                <div class="templates">
-                    <button class="template-btn" onclick="loadTemplate('clean')">Clean Request</button>
-                    <button class="template-btn" onclick="loadTemplate('sqli')">SQL Injection</button>
-                    <button class="template-btn" onclick="loadTemplate('xss')">XSS Attack</button>
-                    <button class="template-btn" onclick="loadTemplate('cmd')">Command Injection</button>
-                </div>
-            </div>
-            
-            <form onsubmit="testRequest(event)">
-                <div class="form-group">
-                    <label>Raw HTTP Request:</label>
-                    <textarea id="request-input" placeholder="Enter raw HTTP request here..."></textarea>
-                </div>
-                
-                <button type="submit">Test Request</button>
-            </form>
-            
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
-                <p>Processing request...</p>
-            </div>
-            
-            <div class="result" id="result"></div>
-        </div>
-    </div>
-    
-    <script>
-        const templates = {
-            clean: 'GET /index.html HTTP/1.1\\r\\nHost: example.com\\r\\nUser-Agent: Mozilla/5.0\\r\\n\\r\\n',
-            sqli: 'GET /api/users?id=1\\' OR \\'1\\'=\\'1 HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n',
-            xss: 'GET /search?q=<script>alert(\\'XSS\\')</script> HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n',
-            cmd: 'POST /cmd HTTP/1.1\\r\\nHost: example.com\\r\\nContent-Type: application/x-www-form-urlencoded\\r\\nContent-Length: 20\\r\\n\\r\\ninput=test;whoami'
-        };
-        
-        function loadTemplate(name) {
-            const textarea = document.getElementById('request-input');
-            const template = templates[name];
-            if (template) {
-                textarea.value = template;
-            }
-        }
-        
-        async function testRequest(event) {
-            event.preventDefault();
-            
-            const rawHttp = document.getElementById('request-input').value;
-            if (!rawHttp.trim()) {
-                alert('Please enter a request');
-                return;
-            }
-            
-            const loading = document.getElementById('loading');
-            const result = document.getElementById('result');
-            
-            loading.style.display = 'block';
-            result.classList.remove('show');
-            
-            try {
-                const response = await fetch('/api/test', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ raw_http: rawHttp })
-                });
-                
-                const data = await response.json();
-                
-                loading.style.display = 'none';
-                
-                // Display result
-                const decision = data.decision.toLowerCase();
-                result.className = `result show ${decision}`;
-                
-                result.innerHTML = `
-                    <h3>Decision: ${data.decision}</h3>
-                    <p>${data.reason}</p>
-                    <div class="result-details">
-                        <div class="detail-item">
-                            <span class="detail-label">Risk Score:</span>
-                            <span class="detail-value">${data.risk_score?.toFixed(1) || 'N/A'}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">Confidence:</span>
-                            <span class="detail-value">${(data.confidence * 100)?.toFixed(1) || 'N/A'}%</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">Request ID:</span>
-                            <span class="detail-value">${data.request_id || 'N/A'}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">Timestamp:</span>
-                            <span class="detail-value">${data.timestamp || new Date().toISOString()}</span>
-                        </div>
-                    </div>
-                    ${data.contributing_factors && data.contributing_factors.length > 0 ? `
-                        <div style="margin-top: 15px;">
-                            <strong>Contributing Factors:</strong>
-                            <ul style="margin-top: 8px; margin-left: 20px;">
-                                ${data.contributing_factors.map(f => `<li>${f}</li>`).join('')}
-                            </ul>
-                        </div>
-                    ` : ''}
-                `;
-            } catch (error) {
-                loading.style.display = 'none';
-                result.className = 'result show block';
-                result.innerHTML = `<h3>Error</h3><p>${error.message}</p>`;
-            }
-        }
-    </script>
-</body>
-</html>
-        '''
-    
-    def _render_logs_page(self) -> str:
-        """Render request logs page"""
-        return '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Request Logs - Phylax WAF</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        header {
-            background: white;
-            padding: 20px 30px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        h1 {
-            color: #667eea;
-            font-size: 28px;
-            margin-bottom: 10px;
-        }
-        
-        nav {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        
-        nav a {
-            padding: 8px 16px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
-            transition: background 0.3s;
-        }
-        
-        nav a:hover {
-            background: #764ba2;
-        }
-        
-        .main {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-        
-        thead {
-            background: #f5f5f5;
-        }
-        
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        
-        th {
-            font-weight: bold;
-            color: #333;
-        }
-        
-        tr:hover {
-            background: #f9f9f9;
-        }
-        
-        .badge {
-            padding: 4px 8px;
-            border-radius: 3px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-        
-        .badge-allow {
-            background: #d4edda;
-            color: #155724;
-        }
-        
-        .badge-challenge {
-            background: #fff3cd;
-            color: #856404;
-        }
-        
-        .badge-block {
-            background: #f8d7da;
-            color: #721c24;
-        }
-        
-        .loading {
-            text-align: center;
-            padding: 40px;
-            color: #667eea;
-        }
-        
-        .pagination {
-            display: flex;
-            gap: 5px;
-            margin-top: 20px;
-            justify-content: center;
-        }
-        
-        .pagination button {
-            padding: 8px 12px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 3px;
-            cursor: pointer;
-        }
-        
-        .pagination button:hover {
-            background: #764ba2;
-        }
-        
-        .pagination button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        
-        .no-data {
-            text-align: center;
-            padding: 40px;
-            color: #999;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>📋 Request Logs</h1>
-            <nav>
-                <a href="/">Dashboard</a>
-                <a href="/test">Test Request</a>
-                <a href="/logs">Request Logs</a>
-            </nav>
-        </header>
-        
-        <div class="main">
-            <h2 style="color: #333; margin-bottom: 10px;">Recent Requests</h2>
-            <p style="color: #666; font-size: 14px;">Showing last 100 requests</p>
-            
-            <div id="loading" class="loading">
-                <div style="display: inline-block; width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; animation: spin 1s linear infinite;"></div>
-                <p>Loading logs...</p>
-            </div>
-            
-            <div id="table-container" style="display: none;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Timestamp</th>
-                            <th>Method</th>
-                            <th>Path</th>
-                            <th>Host</th>
-                            <th>Decision</th>
-                            <th>Risk Score</th>
-                            <th>Request ID</th>
-                        </tr>
-                    </thead>
-                    <tbody id="logs-table">
-                    </tbody>
-                </table>
-                
-                <div class="pagination">
-                    <button onclick="previousPage()" id="prev-btn">← Previous</button>
-                    <span id="page-info" style="padding: 8px 12px; color: #333;"></span>
-                    <button onclick="nextPage()" id="next-btn">Next →</button>
-                </div>
-            </div>
-            
-            <div id="no-data" class="no-data" style="display: none;">
-                No request logs yet.
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        let currentPage = 0;
-        const pageSize = 100;
-        let totalLogs = 0;
-        
-        async function loadLogs() {
-            try {
-                const offset = currentPage * pageSize;
-                const response = await fetch(`/api/logs?limit=${pageSize}&offset=${offset}`);
-                const data = await response.json();
-                
-                totalLogs = data.total;
-                const logs = data.logs;
-                
-                const loading = document.getElementById('loading');
-                const tableContainer = document.getElementById('table-container');
-                const noData = document.getElementById('no-data');
-                const table = document.getElementById('logs-table');
-                
-                if (logs.length === 0) {
-                    loading.style.display = 'none';
-                    noData.style.display = 'block';
-                    tableContainer.style.display = 'none';
-                } else {
-                    loading.style.display = 'none';
-                    noData.style.display = 'none';
-                    tableContainer.style.display = 'block';
-                    
-                    table.innerHTML = logs.map(log => `
-                        <tr>
-                            <td>${new Date(log.timestamp).toLocaleString()}</td>
-                            <td>${log.method || '-'}</td>
-                            <td>${log.path || '-'}</td>
-                            <td>${log.host || '-'}</td>
-                            <td>
-                                <span class="badge badge-${log.decision.toLowerCase()}">
-                                    ${log.decision}
-                                </span>
-                            </td>
-                            <td>${log.risk_score.toFixed(1)}</td>
-                            <td style="font-size: 12px; font-family: monospace;">${log.request_id}</td>
-                        </tr>
-                    `).join('');
-                    
-                    // Update pagination
-                    const totalPages = Math.ceil(totalLogs / pageSize);
-                    document.getElementById('page-info').textContent = `Page ${currentPage + 1} of ${totalPages}`;
-                    document.getElementById('prev-btn').disabled = currentPage === 0;
-                    document.getElementById('next-btn').disabled = currentPage >= totalPages - 1;
-                }
-            } catch (error) {
-                console.error('Error loading logs:', error);
-                document.getElementById('loading').textContent = 'Error loading logs';
-            }
-        }
-        
-        function previousPage() {
-            if (currentPage > 0) {
-                currentPage--;
-                loadLogs();
-            }
-        }
-        
-        function nextPage() {
-            const totalPages = Math.ceil(totalLogs / pageSize);
-            if (currentPage < totalPages - 1) {
-                currentPage++;
-                loadLogs();
-            }
-        }
-        
-        window.addEventListener('load', loadLogs);
-    </script>
-    
-    <style>
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-    </style>
-</body>
-</html>
-        '''
-    
-    def run(self, host: str = '0.0.0.0', port: int = None, debug: bool = False):
-        """Run dashboard"""
-        if port is None:
-            port = self.port
-        
-        self.logger.info(f"🚀 Starting Phylax Dashboard on http://0.0.0.0:{port}")
-        self.app.run(host=host, port=port, debug=debug, threaded=True)
+'''
+
+# Placeholder templates (full implementations in extended version)
+REALTIME_TEMPLATE = '<h2>Real-Time Monitoring (Coming Soon)</h2>'
+REQUESTS_TEMPLATE = '<h2>Request History (Coming Soon)</h2>'
+REQUEST_DETAIL_TEMPLATE = '<h2>Request Detail (Coming Soon)</h2>'
+ATTACKS_TEMPLATE = '<h2>Attack Logs (Coming Soon)</h2>'
+CONFIG_TEMPLATE = '<h2>Configuration Management (Coming Soon)</h2>'
+TEST_TEMPLATE = '<h2>Request Testing (Coming Soon)</h2>'
 
 
 if __name__ == "__main__":
-    app = DashboardApp(waf_url="http://localhost:5000", port=5001)
+    app = EnhancedDashboardApp(waf_url="http://localhost:5000", port=5001)
     app.run(port=5001, debug=True)
