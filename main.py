@@ -8,7 +8,7 @@ import sys
 import time
 import os
 import signal
-
+from dashboard import DashboardApp
 
 def main():
     """Main entry point"""
@@ -135,4 +135,6 @@ app.run(host='0.0.0.0', port=5001, debug=False)
 
 
 if __name__ == "__main__":
-    main()
+    # Start dashboard
+    app = DashboardApp(waf_url="http://localhost:5000", port=5001)
+    app.run(host='0.0.0.0', port=5001, debug=False)
