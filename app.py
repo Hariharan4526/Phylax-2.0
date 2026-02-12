@@ -1,53 +1,67 @@
-# app.py - Single unified Flask application for Phylax-2.0
-# Combines: Website + Dashboard + WAF Integration
-# Single Port: 5001
+# app.py - Fixed Production-Ready Flask Application
+# Single unified app for Website + Dashboard + WAF Integration on port 5001
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response
 from flask_cors import CORS
 import sqlite3
 import json
-import os
 import logging
 from datetime import datetime, timedelta
 import requests
 import time
+from functools import wraps
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import configuration
+from config import config, logger
+
+# ============== CONFIGURATION ==============
+
+app = Flask(__name__)
+app.config.update(config.__dict__)
+CORS(app)
+
+# ============== SIMPLE WAF BRIDGE ==============
 
 class WAFBridge:
-    """Simple WAF Integration Bridge"""
+    """Simple, production-grade WAF Integration Bridge"""
     
-    def __init__(self, waf_url="http://localhost:5000", db_path="dashboard.db"):
+    def __init__(self, waf_url, db_path, timeout=10, retries=3, retry_delay=0.5):
         self.waf_url = waf_url
         self.db_path = db_path
+        self.timeout = timeout
+        self.retries = retries
+        self.retry_delay = retry_delay
         self.session = requests.Session()
-        self.session.timeout = 10
-        logger.info(f"WAF Bridge initialized - WAF URL: {waf_url}")
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"WAF Bridge initialized - URL: {waf_url}")
     
     def is_healthy(self):
-        """Check if WAF is online"""
+        """Check if WAF engine is online"""
         try:
             resp = self.session.get(f"{self.waf_url}/waf/health", timeout=5)
             return resp.status_code == 200
-        except:
+        except Exception as e:
+            self.logger.warning(f"WAF health check failed: {e}")
             return False
     
     def send_request(self, raw_http):
         """Send request to WAF for analysis"""
         if not self.is_healthy():
+            self.logger.warning("WAF offline, returning mock response")
             return self._mock_response()
         
         try:
             resp = self.session.post(
                 f"{self.waf_url}/waf/check",
                 json={"raw_http": raw_http},
-                timeout=10
+                timeout=self.timeout
             )
             if resp.status_code in [200, 403]:
                 return resp.json()
+        except requests.exceptions.Timeout:
+            self.logger.error("WAF request timeout")
         except Exception as e:
-            logger.warning(f"WAF request failed: {e}")
+            self.logger.error(f"WAF request error: {e}")
         
         return self._mock_response()
     
@@ -60,11 +74,15 @@ class WAFBridge:
                 INSERT INTO dashboard_logs 
                 (timestamp, request_id, method, path, ip_address, decision, risk_score, user_agent)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (datetime.now().isoformat(), request_id, method, path, ip_addr, decision, risk_score, user_agent))
+            ''', (
+                datetime.now().isoformat(), request_id, method, path, 
+                ip_addr, decision, risk_score, user_agent
+            ))
             conn.commit()
             conn.close()
+            self.logger.debug(f"Logged request {request_id}")
         except Exception as e:
-            logger.error(f"Database error: {e}")
+            self.logger.error(f"Database logging error: {e}")
     
     def _mock_response(self):
         """Mock response when WAF offline"""
@@ -74,7 +92,7 @@ class WAFBridge:
             "decision": "ALLOW",
             "risk_score": 5.0,
             "confidence": 0.9,
-            "reason": "Mock - WAF offline",
+            "reason": "WAF offline - mock response",
             "contributing_factors": ["WAF unavailable"],
             "signature_matches": [],
             "ml_prediction": {"attack_probability": 0.05},
@@ -82,15 +100,8 @@ class WAFBridge:
             "model_confidence": {"signature": 0, "ml": 5, "anomaly": 0}
         }
 
-# Initialize Flask App
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'phylax-2026-secret-key'
-CORS(app)
+# ============== DATABASE INITIALIZATION ==============
 
-# Initialize WAF Bridge
-waf = WAFBridge("http://localhost:5000", "dashboard.db")
-
-# Initialize Database
 def init_db():
     """Initialize SQLite database"""
     try:
@@ -117,11 +128,56 @@ def init_db():
         
         conn.commit()
         conn.close()
-        logger.info("Database initialized")
+        logger.info("Database initialized successfully")
     except Exception as e:
-        logger.error(f"Database init error: {e}")
+        logger.error(f"Database initialization error: {e}")
 
 init_db()
+
+# Initialize WAF Bridge
+waf = WAFBridge(config.WAF_URL, "dashboard.db", config.REQUEST_TIMEOUT, config.RETRIES, config.RETRY_DELAY)
+
+# ============== ERROR HANDLERS ==============
+
+def handle_error(status_code, message):
+    """Generic error handler"""
+    logger.error(f"Error {status_code}: {message}")
+    return jsonify({
+        'success': False,
+        'error': message,
+        'timestamp': datetime.now().isoformat()
+    }), status_code
+
+@app.errorhandler(404)
+def not_found(error):
+    """404 handler"""
+    return handle_error(404, 'Endpoint not found')
+
+@app.errorhandler(500)
+def server_error(error):
+    """500 handler"""
+    return handle_error(500, 'Internal server error')
+
+# ============== UTILITY FUNCTIONS ==============
+
+def get_db():
+    """Get database connection"""
+    conn = sqlite3.connect('dashboard.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def extract_http_details(raw_http):
+    """Extract method and path from raw HTTP"""
+    try:
+        lines = raw_http.split('\n')
+        if lines:
+            parts = lines[0].split()
+            method = parts[0] if len(parts) > 0 else 'GET'
+            path = parts[1] if len(parts) > 1 else '/'
+            return method, path
+    except:
+        pass
+    return 'GET', '/'
 
 # ============== WEB ROUTES ==============
 
@@ -141,6 +197,7 @@ def dashboard():
 def health():
     """Health check endpoint"""
     return jsonify({
+        'success': True,
         'status': 'healthy',
         'service': 'Phylax Dashboard',
         'timestamp': datetime.now().isoformat()
@@ -150,6 +207,7 @@ def health():
 def waf_health():
     """Check WAF engine status"""
     is_healthy = waf.is_healthy()
+    logger.info(f"WAF health check: {'ONLINE' if is_healthy else 'OFFLINE'}")
     return jsonify({
         'success': True,
         'waf_healthy': is_healthy,
@@ -165,21 +223,23 @@ def waf_test():
     """Test a request against WAF"""
     try:
         data = request.get_json()
+        if not data:
+            return handle_error(400, 'No JSON data provided')
+        
         raw_http = data.get('raw_http', '')
         ip_address = data.get('ip_address', request.remote_addr)
-        user_agent = data.get('user_agent', '')
+        user_agent = data.get('user_agent', request.headers.get('User-Agent', ''))
         
         if not raw_http:
-            return jsonify({'success': False, 'error': 'Missing raw_http'}), 400
+            return handle_error(400, 'Missing raw_http field')
         
         # Send to WAF
+        start_time = time.time()
         decision = waf.send_request(raw_http)
+        response_time = (time.time() - start_time) * 1000
         
         # Extract request details
-        lines = raw_http.split('\n')
-        request_line = lines[0].split() if lines else []
-        method = request_line[0] if len(request_line) > 0 else 'GET'
-        path = request_line[1] if len(request_line) > 1 else '/'
+        method, path = extract_http_details(raw_http)
         
         # Log to database
         if decision:
@@ -191,37 +251,34 @@ def waf_test():
                 user_agent
             )
         
+        logger.info(f"WAF test: {method} {path} -> {decision.get('decision')} (risk={decision.get('risk_score')})")
+        
         return jsonify({
             'success': True,
-            'decision': decision
+            'decision': decision,
+            'response_time_ms': round(response_time, 2)
         })
     except Exception as e:
         logger.error(f"WAF test error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 @app.route('/api/waf/stats', methods=['GET'])
 def waf_stats():
     """Get WAF engine statistics"""
     try:
         if not waf.is_healthy():
-            return jsonify({'success': False, 'error': 'WAF offline'}), 503
+            return handle_error(503, 'WAF engine offline')
         
         resp = waf.session.get(f"{waf.waf_url}/waf/stats", timeout=5)
         if resp.status_code == 200:
             return jsonify({'success': True, 'data': resp.json()})
         else:
-            return jsonify({'success': False, 'error': 'Could not get stats'}), 500
+            return handle_error(500, 'Could not get WAF statistics')
     except Exception as e:
         logger.error(f"WAF stats error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 # ============== API: DASHBOARD STATISTICS ==============
-
-def get_db():
-    """Get database connection"""
-    conn = sqlite3.connect('dashboard.db')
-    conn.row_factory = sqlite3.Row
-    return conn
 
 @app.route('/api/stats/overview', methods=['GET'])
 def get_overview():
@@ -264,7 +321,7 @@ def get_overview():
         })
     except Exception as e:
         logger.error(f"Overview error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 @app.route('/api/stats/hourly', methods=['GET'])
 def get_hourly():
@@ -297,7 +354,7 @@ def get_hourly():
         })
     except Exception as e:
         logger.error(f"Hourly error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 @app.route('/api/stats/top-ips', methods=['GET'])
 def get_top_ips():
@@ -332,7 +389,7 @@ def get_top_ips():
         })
     except Exception as e:
         logger.error(f"Top IPs error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 @app.route('/api/stats/recent-requests', methods=['GET'])
 def get_recent():
@@ -366,7 +423,7 @@ def get_recent():
         })
     except Exception as e:
         logger.error(f"Recent requests error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
 @app.route('/api/stats/decision-distribution', methods=['GET'])
 def get_distribution():
@@ -396,38 +453,38 @@ def get_distribution():
         })
     except Exception as e:
         logger.error(f"Distribution error: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return handle_error(500, str(e))
 
-# ============== ERROR HANDLERS ==============
+# ============== REQUEST LOGGING MIDDLEWARE ==============
 
-@app.errorhandler(404)
-def not_found(error):
-    """404 handler"""
-    return jsonify({'error': 'Not found'}), 404
+@app.before_request
+def log_request():
+    """Log incoming requests"""
+    logger.debug(f"{request.method} {request.path} from {request.remote_addr}")
 
-@app.errorhandler(500)
-def server_error(error):
-    """500 handler"""
-    logger.error(f"Server error: {error}")
-    return jsonify({'error': 'Internal server error'}), 500
+@app.after_request
+def log_response(response):
+    """Log response"""
+    logger.debug(f"Response: {response.status_code} for {request.path}")
+    return response
 
 # ============== MAIN ==============
 
 if __name__ == '__main__':
-    print("\n" + "="*80)
-    print("🚀 STARTING PHYLAX-2.0 UNIFIED APPLICATION")
-    print("="*80)
-    print("\n✅ Database: dashboard.db")
-    print("✅ WAF Bridge: http://localhost:5000")
-    print("✅ Dashboard: http://localhost:5001")
-    print("\n📊 Routes:")
-    print("   GET  http://localhost:5001/                   → Dashboard")
-    print("   GET  http://localhost:5001/api/health         → Health check")
-    print("   GET  http://localhost:5001/api/waf/health     → WAF status")
-    print("   POST http://localhost:5001/api/waf/test       → Test request")
-    print("   GET  http://localhost:5001/api/stats/*        → Statistics")
-    print("\n" + "="*80)
-    print("\n🌐 Open: http://localhost:5001")
-    print("💡 Press Ctrl+C to stop\n")
+    logger.info("="*80)
+    logger.info("🚀 STARTING PHYLAX-2.0 UNIFIED APPLICATION")
+    logger.info("="*80)
+    logger.info(f"✅ Database: dashboard.db")
+    logger.info(f"✅ WAF Bridge: {config.WAF_URL}")
+    logger.info(f"✅ Dashboard: http://{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}")
+    logger.info(f"✅ Debug Mode: {config.DEBUG}")
+    logger.info("="*80)
+    logger.info(f"\n🌐 Access at: http://localhost:{config.DASHBOARD_PORT}")
+    logger.info("💡 Press Ctrl+C to stop\n")
     
-    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+    app.run(
+        host=config.DASHBOARD_HOST,
+        port=config.DASHBOARD_PORT,
+        debug=config.DEBUG,
+        use_reloader=False
+    )
