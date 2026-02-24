@@ -8,6 +8,15 @@ from pathlib import Path
 # Get project root directory
 PROJECT_ROOT = Path(__file__).parent
 
+
+def _get_latest_model_path(pattern: str, fallback_name: str) -> str:
+    """Resolve latest model artifact by filename pattern."""
+    model_dir = PROJECT_ROOT / 'models'
+    matches = sorted(model_dir.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
+    if matches:
+        return str(matches[0])
+    return str(model_dir / fallback_name)
+
 class Config:
     """Base configuration"""
     
@@ -28,9 +37,9 @@ class Config:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
     # Model Configuration
-    MODEL_PATH = os.getenv('MODEL_PATH', str(PROJECT_ROOT / 'models' / 'gb_model.pkl'))
-    SCALER_PATH = os.getenv('SCALER_PATH', str(PROJECT_ROOT / 'models' / 'scaler.pkl'))
-    FEATURES_PATH = os.getenv('FEATURES_PATH', str(PROJECT_ROOT / 'models' / 'feature_names.json'))
+    MODEL_PATH = os.getenv('MODEL_PATH', _get_latest_model_path('gb_model_*.pkl', 'gb_model.pkl'))
+    SCALER_PATH = os.getenv('SCALER_PATH', _get_latest_model_path('scaler_*.pkl', 'scaler.pkl'))
+    FEATURES_PATH = os.getenv('FEATURES_PATH', _get_latest_model_path('feature_names_*.json', 'feature_names.json'))
     
     # Logging Configuration
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -51,6 +60,16 @@ class Config:
     # API Configuration
     JSON_SORT_KEYS = False
     JSONIFY_PRETTYPRINT_REGULAR = DEBUG
+
+    # Security and policy configuration
+    ADMIN_API_KEY = os.getenv('ADMIN_API_KEY', '')
+    REQUIRE_ADMIN_API_KEY = os.getenv('REQUIRE_ADMIN_API_KEY', 'False').lower() == 'true'
+    WAF_FAIL_OPEN = os.getenv('WAF_FAIL_OPEN', 'False').lower() == 'true'
+
+    # Basic request rate limiting
+    RATE_LIMIT_ENABLED = os.getenv('RATE_LIMIT_ENABLED', 'True').lower() == 'true'
+    RATE_LIMIT_REQUESTS_PER_MINUTE = int(os.getenv('RATE_LIMIT_REQUESTS_PER_MINUTE', '120'))
+    RATE_LIMIT_WINDOW_SECONDS = int(os.getenv('RATE_LIMIT_WINDOW_SECONDS', '60'))
     
     @staticmethod
     def init_logging():

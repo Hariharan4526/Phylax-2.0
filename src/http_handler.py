@@ -4,6 +4,8 @@ Receives HTTP requests, processes them through WAF engine, and returns decisions
 """
 
 import logging
+import hmac
+import time
 from typing import Dict, Tuple
 from datetime import datetime
 import json
@@ -44,6 +46,8 @@ class WAFHTTPHandler:
             'allowed_requests': 0,
             'errors': 0
         }
+
+        self._rate_limit_cache = {}
         
         self._setup_routes()
         self.logger.info("WAF HTTP Handler initialized")
@@ -81,6 +85,8 @@ class WAFHTTPHandler:
         @self.app.route('/waf/stats', methods=['GET'])
         def get_stats():
             """Get WAF statistics"""
+            if not self._is_admin_authorized():
+                return jsonify({'error': 'Unauthorized'}), 401
             return self._handle_stats_request()
         
         @self.app.route('/waf/health', methods=['GET'])
@@ -95,6 +101,8 @@ class WAFHTTPHandler:
         @self.app.route('/waf/config', methods=['GET'])
         def get_config():
             """Get WAF configuration"""
+            if not self._is_admin_authorized():
+                return jsonify({'error': 'Unauthorized'}), 401
             return jsonify(self.waf_engine.config)
         
         @self.app.errorhandler(400)
@@ -126,6 +134,10 @@ class WAFHTTPHandler:
         }
         """
         try:
+            rate_limit_error = self._enforce_rate_limit()
+            if rate_limit_error is not None:
+                return rate_limit_error
+
             # Get JSON from request
             data = request.get_json()
             if not data:
@@ -184,6 +196,46 @@ class WAFHTTPHandler:
             self.logger.error(f"Error processing request: {e}")
             self.stats['errors'] += 1
             return jsonify({'error': 'Internal server error'}), 500
+
+    def _is_admin_authorized(self) -> bool:
+        """Authorize access to admin endpoints using API key."""
+        if not self.waf_engine.config.get('require_admin_api_key', False):
+            return True
+
+        configured_key = self.waf_engine.config.get('admin_api_key', '')
+        if not configured_key:
+            self.logger.error("Admin API key required but not configured")
+            return False
+
+        request_key = request.headers.get('X-API-Key', '')
+        if not request_key:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.lower().startswith('bearer '):
+                request_key = auth_header.split(' ', 1)[1].strip()
+
+        return hmac.compare_digest(request_key, configured_key)
+
+    def _enforce_rate_limit(self):
+        """Apply basic in-memory IP rate limiting to request inspection endpoint."""
+        max_requests = int(self.waf_engine.config.get('request_limit_per_minute', 120))
+        window_seconds = int(self.waf_engine.config.get('rate_limit_window_seconds', 60))
+
+        now = time.time()
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+        bucket = self._rate_limit_cache.get(client_ip)
+
+        if bucket is None or now - bucket['window_start'] >= window_seconds:
+            self._rate_limit_cache[client_ip] = {
+                'window_start': now,
+                'count': 1
+            }
+            return None
+
+        bucket['count'] += 1
+        if bucket['count'] > max_requests:
+            return jsonify({'error': 'Rate limit exceeded'}), 429
+
+        return None
     
     def _handle_stats_request(self) -> Dict:
         """Handle statistics request"""

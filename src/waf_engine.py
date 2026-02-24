@@ -5,6 +5,7 @@ Coordinates HTTP parsing, signature detection, ML classification, anomaly detect
 
 import json
 import logging
+import os
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -88,6 +89,8 @@ class WAFEngine:
         self.regex_engine = None
         self.anomaly_detector = None
         self.risk_aggregator = None
+
+        self._initialize_default_modules()
         
         self.logger.info("WAF Engine initialized successfully!")
     
@@ -95,6 +98,9 @@ class WAFEngine:
         """Setup logging"""
         logger = logging.getLogger("WAFEngine")
         logger.setLevel(logging.INFO)
+
+        if logger.handlers:
+            return logger
         
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
@@ -104,6 +110,32 @@ class WAFEngine:
         logger.addHandler(handler)
         
         return logger
+
+    def _initialize_default_modules(self):
+        """Initialize built-in modules when available."""
+        try:
+            from src.http_parser import HTTPParser
+            self.http_parser = HTTPParser()
+        except Exception as e:
+            self.logger.warning(f"HTTP parser unavailable: {e}")
+
+        try:
+            from src.regex_engine import RegexSignatureEngine
+            self.regex_engine = RegexSignatureEngine()
+        except Exception as e:
+            self.logger.warning(f"Regex engine unavailable: {e}")
+
+        try:
+            from src.anamoly_detector import AnomalyDetector
+            self.anomaly_detector = AnomalyDetector()
+        except Exception as e:
+            self.logger.warning(f"Anomaly detector unavailable: {e}")
+
+        try:
+            from src.risk_aggregator import RiskAggregator
+            self.risk_aggregator = RiskAggregator()
+        except Exception as e:
+            self.logger.warning(f"Risk aggregator unavailable: {e}")
     
     def _load_config(self, config_path: Optional[str]) -> Dict:
         """Load configuration"""
@@ -123,7 +155,12 @@ class WAFEngine:
             "anomaly_threshold": 0.7,
             "enable_logging": True,
             "cache_decisions": False,
-            "max_payload_size": 10 * 1024 * 1024  # 10 MB
+            "max_payload_size": 10 * 1024 * 1024,  # 10 MB
+            "fail_open": os.getenv('WAF_FAIL_OPEN', 'false').lower() == 'true',
+            "admin_api_key": os.getenv('ADMIN_API_KEY', ''),
+            "require_admin_api_key": os.getenv('REQUIRE_ADMIN_API_KEY', 'false').lower() == 'true',
+            "request_limit_per_minute": int(os.getenv('RATE_LIMIT_REQUESTS_PER_MINUTE', '120')),
+            "rate_limit_window_seconds": int(os.getenv('RATE_LIMIT_WINDOW_SECONDS', '60'))
         }
         
         if config_path and Path(config_path).exists():
@@ -279,8 +316,28 @@ class WAFEngine:
         
         try:
             matches = self.regex_engine.detect_in_request(request)
-            self.logger.debug(f"Found {len(matches)} signature matches")
-            return matches
+            flattened = []
+
+            if isinstance(matches, dict):
+                for location, match_list in matches.items():
+                    for match in match_list:
+                        if hasattr(match, '__dict__'):
+                            match_dict = dict(match.__dict__)
+                        elif isinstance(match, dict):
+                            match_dict = dict(match)
+                        else:
+                            continue
+                        match_dict['location'] = match_dict.get('location', location)
+                        flattened.append(match_dict)
+            elif isinstance(matches, list):
+                for match in matches:
+                    if hasattr(match, '__dict__'):
+                        flattened.append(dict(match.__dict__))
+                    elif isinstance(match, dict):
+                        flattened.append(dict(match))
+
+            self.logger.debug(f"Found {len(flattened)} signature matches")
+            return flattened
         except Exception as e:
             self.logger.error(f"Error in signature detection: {e}")
             return []
@@ -310,7 +367,7 @@ class WAFEngine:
                 'attack_probability': float(probability),
                 'confidence': float(max(probability, 1 - probability)),
                 'model_type': 'gradient_boosting',
-                'prediction': 'attack' if probability > 0.5 else 'benign'
+                'prediction': 'attack' if probability > self.config.get('ml_threshold', 0.5) else 'benign'
             }
         except Exception as e:
             self.logger.error(f"Error in ML classification: {e}")
@@ -322,21 +379,29 @@ class WAFEngine:
     
     def _extract_features(self, request: Dict) -> List[float]:
         """Extract features from request for ML"""
-        # This should match the features used during training
-        # For now, create placeholder features
-        payload = request.get('body', '') + ' ' + request.get('path', '')
-        
+        feature_map = {}
+
+        if self.http_parser is not None and hasattr(self.http_parser, 'extract_features_for_ml'):
+            try:
+                feature_map = self.http_parser.extract_features_for_ml(request)
+            except Exception as e:
+                self.logger.warning(f"Feature extraction from parser failed: {e}")
+
+        if not feature_map:
+            if isinstance(request, dict):
+                payload = f"{request.get('body', '')} {request.get('path', '')}"
+            else:
+                payload = f"{getattr(request, 'body', '')} {getattr(request, 'path', '')}"
+            feature_map = {
+                'request_body_length': float(len(payload)),
+                'decoded_body_length': float(len(payload)),
+                'path_length': float(len(getattr(request, 'path', ''))),
+            }
+
         features = []
         for feature_name in self.feature_names:
-            # Mock feature extraction
-            # In production, use proper feature extraction from training
-            if 'length' in feature_name:
-                features.append(float(len(payload)))
-            elif 'ratio' in feature_name:
-                features.append(0.5)
-            else:
-                features.append(0.0)
-        
+            features.append(float(feature_map.get(feature_name, 0.0)))
+
         return features
     
     def _detect_anomalies(self, request: Dict) -> Dict:
@@ -374,12 +439,20 @@ class WAFEngine:
         context_score = 0  # Placeholder for context/IP reputation
         
         # Weighted average
-        risk_score = (
-            weights['signature'] * sig_score +
-            weights['ml'] * ml_score +
-            weights['anomaly'] * anom_score +
-            weights['context'] * context_score
-        )
+        if self.risk_aggregator is not None and hasattr(self.risk_aggregator, 'aggregate'):
+            risk_score = self.risk_aggregator.aggregate(
+                signature_score=sig_score,
+                ml_score=ml_score,
+                anomaly_score=anom_score,
+                context_score=context_score
+            )
+        else:
+            risk_score = (
+                weights['signature'] * sig_score +
+                weights['ml'] * ml_score +
+                weights['anomaly'] * anom_score +
+                weights['context'] * context_score
+            )
         
         # Make decision based on thresholds
         thresholds = self.config['risk_thresholds']
@@ -443,14 +516,19 @@ class WAFEngine:
         )
     
     def _create_error_decision(self, request_id: str, error: str) -> WAFDecision:
-        """Create ALLOW decision on error (fail open)"""
+        """Create decision on processing error based on fail-open policy."""
+        fail_open = bool(self.config.get('fail_open', False))
+        decision = 'ALLOW' if fail_open else 'BLOCK'
+        risk_score = 0.0 if fail_open else 100.0
+        reason = f"Error during processing ({'fail-open' if fail_open else 'fail-closed'}): {error}"
+
         return WAFDecision(
             request_id=request_id,
             timestamp=datetime.utcnow().isoformat(),
-            decision='ALLOW',
-            risk_score=0.0,
+            decision=decision,
+            risk_score=risk_score,
             confidence=0.0,
-            reason=f"Error during processing: {error}",
+            reason=reason,
             signature_matches=[],
             ml_prediction={},
             anomaly_score=0.0,

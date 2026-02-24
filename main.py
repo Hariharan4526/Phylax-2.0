@@ -6,9 +6,6 @@ Runs both WAF Engine (port 5000) and Dashboard (port 5001)
 import subprocess
 import sys
 import time
-import os
-import signal
-from dashboard import DashboardApp
 
 def main():
     """Main entry point"""
@@ -25,24 +22,7 @@ def main():
     try:
         # Start WAF Engine
         print("📡 Starting WAF Engine on port 5000...")
-        waf_process = subprocess.Popen(
-            [sys.executable, "-c", """
-import sys
-sys.path.insert(0, '.')
-from src.waf_engine import WAFEngine
-from src.http_handler import WAFHTTPHandler
-
-engine = WAFEngine(
-    model_path="models/gb_model_20260203_144133.pkl",
-    scaler_path="models/scaler_20260203_144133.pkl",
-    feature_names_path="models/feature_names_20260203_144133.json",
-    config_path="config.json"
-)
-
-handler = WAFHTTPHandler(engine)
-handler.run(host='0.0.0.0', port=5000, debug=False)
-            """]
-        )
+        waf_process = subprocess.Popen([sys.executable, "waf_server.py"])
         
         print("✅ WAF Engine started!")
         print()
@@ -52,16 +32,7 @@ handler.run(host='0.0.0.0', port=5000, debug=False)
         
         # Start Dashboard
         print("🎨 Starting Dashboard on port 5001...")
-        dashboard_process = subprocess.Popen(
-            [sys.executable, "-c", """
-import sys
-sys.path.insert(0, '.')
-from dashboard import DashboardApp
-
-app = DashboardApp(waf_url="http://localhost:5000", port=5001)
-app.run(host='0.0.0.0', port=5001, debug=False)
-            """]
-        )
+        dashboard_process = subprocess.Popen([sys.executable, "app.py"])
         
         print("✅ Dashboard started!")
         print()
@@ -135,6 +106,4 @@ app.run(host='0.0.0.0', port=5001, debug=False)
 
 
 if __name__ == "__main__":
-    # Start dashboard
-    app = DashboardApp(waf_url="http://localhost:5000", port=5001)
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    main()

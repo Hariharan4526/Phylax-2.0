@@ -6,6 +6,7 @@ from flask_cors import CORS
 import sqlite3
 import json
 import logging
+import hmac
 from datetime import datetime, timedelta
 import requests
 import time
@@ -19,6 +20,63 @@ from config import config, logger
 app = Flask(__name__)
 app.config.update(config.__dict__)
 CORS(app)
+
+_rate_limit_state = {}
+
+
+def _client_ip() -> str:
+    forwarded = request.headers.get('X-Forwarded-For', '')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def require_admin_api_key(fn):
+    """Protect admin endpoints with API key when enabled."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not config.REQUIRE_ADMIN_API_KEY:
+            return fn(*args, **kwargs)
+
+        if not config.ADMIN_API_KEY:
+            return handle_error(503, 'Admin API key policy enabled but key is not configured')
+
+        provided_key = request.headers.get('X-API-Key', '')
+        if not provided_key:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.lower().startswith('bearer '):
+                provided_key = auth_header.split(' ', 1)[1].strip()
+
+        if not hmac.compare_digest(provided_key, config.ADMIN_API_KEY):
+            return handle_error(401, 'Unauthorized')
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def rate_limit(max_requests: int, window_seconds: int):
+    """Basic in-memory sliding window rate limiter."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not config.RATE_LIMIT_ENABLED:
+                return fn(*args, **kwargs)
+
+            ip_address = _client_ip()
+            now = time.time()
+            window_start = now - window_seconds
+
+            request_times = _rate_limit_state.get(ip_address, [])
+            request_times = [t for t in request_times if t >= window_start]
+            request_times.append(now)
+            _rate_limit_state[ip_address] = request_times
+
+            if len(request_times) > max_requests:
+                return handle_error(429, 'Rate limit exceeded')
+
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 # ============== SIMPLE WAF BRIDGE ==============
 
@@ -219,6 +277,7 @@ def waf_health():
 # ============== API: WAF TESTING ==============
 
 @app.route('/api/waf/test', methods=['POST'])
+@rate_limit(config.RATE_LIMIT_REQUESTS_PER_MINUTE, config.RATE_LIMIT_WINDOW_SECONDS)
 def waf_test():
     """Test a request against WAF"""
     try:
@@ -263,6 +322,7 @@ def waf_test():
         return handle_error(500, str(e))
 
 @app.route('/api/waf/stats', methods=['GET'])
+@require_admin_api_key
 def waf_stats():
     """Get WAF engine statistics"""
     try:
@@ -281,6 +341,7 @@ def waf_stats():
 # ============== API: DASHBOARD STATISTICS ==============
 
 @app.route('/api/stats/overview', methods=['GET'])
+@require_admin_api_key
 def get_overview():
     """Get overview statistics"""
     try:
@@ -324,6 +385,7 @@ def get_overview():
         return handle_error(500, str(e))
 
 @app.route('/api/stats/hourly', methods=['GET'])
+@require_admin_api_key
 def get_hourly():
     """Get hourly statistics"""
     try:
@@ -357,6 +419,7 @@ def get_hourly():
         return handle_error(500, str(e))
 
 @app.route('/api/stats/top-ips', methods=['GET'])
+@require_admin_api_key
 def get_top_ips():
     """Get top attacking IPs"""
     try:
@@ -392,6 +455,7 @@ def get_top_ips():
         return handle_error(500, str(e))
 
 @app.route('/api/stats/recent-requests', methods=['GET'])
+@require_admin_api_key
 def get_recent():
     """Get recent requests"""
     try:
@@ -426,6 +490,7 @@ def get_recent():
         return handle_error(500, str(e))
 
 @app.route('/api/stats/decision-distribution', methods=['GET'])
+@require_admin_api_key
 def get_distribution():
     """Get decision distribution"""
     try:
